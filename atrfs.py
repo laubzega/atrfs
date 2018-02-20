@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 
-import os
-import sys
+import collections
 import errno
+import os
+import re
+import sys
 import struct
 import stat
-import collections
 import threading
 
 from fuse import FUSE, FuseOSError, Operations
@@ -18,8 +19,22 @@ class DirEntry:
         self.sector = 0
         self.position = 0
         self.name = ""
-        self.start = 0
+        self.first = 0
         self.sectors = 0
+
+    def is_unused(self):
+        return self.flag == 0
+
+    def is_deleted(self):
+        return self.flag & 0x80
+
+    def is_locked(self):
+        return self.flag & 0x20
+
+    def is_valid(self):
+        return not self.is_unused() and not self.is_deleted()
+        #return self.flag != 0 and not (self.flag & 0x80)
+
     
 class atrfs(Operations):
     def __init__(self, root):
@@ -27,6 +42,7 @@ class atrfs(Operations):
         self.directory_size = 64
         self.handles = {}
         self.vtoc_lock = threading.Lock()
+        self.filename_regex = re.compile(R"^[a-zA-Z0-9]{1,8}(\.[a-zA-Z0-9]{1,3}|)$")
 
         self.atr_file = open(self.root, mode="r+b")
         header = self.atr_file.read(7);
@@ -42,10 +58,25 @@ class atrfs(Operations):
         if atr_magic != 0x0296:
             return -1
 
+        data = self.read_sector(360)
+        # Check if the ATR is an AtariDOS image
+        if data[0] != 2 and data[0] != 0:
+            return -1
+
         self.handles = collections.OrderedDict()
         # We'll use the index as inode number, so we need to block the one
         # at position 0.
         self.handles["\x00"] = 0
+
+    def vtoc_lock_acquire(self, method_name):
+        print method_name + ": waiting for VTOC lock"
+        self.vtoc_lock.acquire()
+        print "VTOC lock acquired"
+
+    def vtoc_lock_release(self, method_name):
+        self.vtoc_lock.release()
+        print method_name + ": VTOC lock released"
+
 
     def _full_path(self, partial):
         if partial.startswith("/"):
@@ -59,26 +90,37 @@ class atrfs(Operations):
 
         return prefix + ("." + extension if extension else "")
 
+    def is_filename_valid(self, name):
+        return self.filename_regex.match(name)
+        
     #TODO This will fail for hand-edited file names with multiple dots, etc.
     def to_dos_notation(self, name):
         parts = name.split('.')
 
         return parts[0].ljust(8) + (parts[1].ljust(3) if len(parts) > 1 else "   ")
 
+    def sector_to_atr_offset(self, sector_number):
+        return 16 + min(sector_number - 1, 3) * 128 \
+                  + ((sector_number - 4) * self.sector_size) if sector_number \
+                  >= 4 else 0
+ 
     def read_sector(self, sector_number):
-#        print "Reading sector: ", sector_number
+        #print "Reading sector: ", sector_number
         if sector_number == 0 or sector_number > self.sector_count:
             return ""
 
-        self.atr_file.seek(16 + (sector_number - 1) * self.sector_size);
+        offset = self.sector_to_atr_offset(sector_number)
+        self.atr_file.seek(offset);
+
         return bytearray(self.atr_file.read(self.sector_size))
 
     def write_sector(self, sector_number, data):
-        print "Writing sector: ", sector_number
+        #print "Writing sector: ", sector_number
         if sector_number == 0 or sector_number > self.sector_count:
             return False
 
-        self.atr_file.seek(16 + (sector_number - 1) * self.sector_size);
+        offset = self.sector_to_atr_offset(sector_number)
+        self.atr_file.seek(offset);
         self.atr_file.write(data)
 
         return True
@@ -86,7 +128,7 @@ class atrfs(Operations):
     def sector_chain(self, sector):
         while True:
             data = self.read_sector(sector)
-            next_sector, fill = struct.unpack(">HB", data[125:128])
+            next_sector, fill = struct.unpack(">HB", data[-3:])
             yield sector, fill, data
 
             sector = next_sector & (1 << 10) - 1
@@ -105,16 +147,12 @@ class atrfs(Operations):
         return file_size
 
     def load_atari_file(self, sector):
-
         data = bytearray("")
         for sector, size, sector_data in self.sector_chain(sector):
             print "Adding ", size, " bytes to the buffer"
             data.extend(sector_data[0:size])
 
         return data
-
-    def valid_entry(self, flag):
-        return flag != 0 and not (flag & 0x80)
 
     def directory_walker(self, function):
         de = DirEntry()
@@ -125,12 +163,11 @@ class atrfs(Operations):
             for pos in range(0, 8):
                 offset = pos * 16;
                 de.position = pos
-                de.flag, de.sectors, de.start = \
+                de.flag, de.sectors, de.first = \
                     struct.unpack("<BHH", data[offset:offset+5])
                 de.name = str(data[offset + 5:offset+16])
 
                 retval = function(de)
-                #retval = function(sector - 361, entry, name, flag, start, sectors)
 
                 if retval:
                     return retval
@@ -138,7 +175,7 @@ class atrfs(Operations):
         return None
 
     def name_matcher(self, path, dir_entry):
-        if self.valid_entry(dir_entry.flag) and dir_entry.name == path:
+        if dir_entry.is_valid() and dir_entry.name == path:
             print "matcher: " , path
             pprint (vars(dir_entry))
             return dir_entry
@@ -150,7 +187,7 @@ class atrfs(Operations):
 
     def count_valid_dir_entries(self):
         def entry_counter(dir_entry):
-            if self.valid_entry(dir_entry.flag):
+            if dir_entry.is_valid():
                 entry_counter.entries += 1
 
         # Poor man's mutable closure variables
@@ -162,7 +199,7 @@ class atrfs(Operations):
     def get_dir_entries(self):
         dirents = ['.', '..']
         def entry_getter(entries, dir_entry):
-            if self.valid_entry(dir_entry.flag):
+            if dir_entry.is_valid():
                 entries.append(self.to_unix_notation(dir_entry.name))
 
         self.directory_walker(partial(entry_getter, dirents))
@@ -197,14 +234,9 @@ class atrfs(Operations):
         if path.startswith("/"):
             path = path[1:]
 
-        print "Waiting for VTOC lock"
-        self.vtoc_lock.acquire()
-        print "VTOC lock acquired"
-
+        self.vtoc_lock_acquire("getattr")
         dir_entry = self.find_dir_entry(self.to_dos_notation(path))
-
-        self.vtoc_lock.release()
-        print "VTOC lock released"
+        self.vtoc_lock_release("getattr")
 
         if not dir_entry:
             raise FuseOSError(errno.ENOENT)
@@ -212,10 +244,10 @@ class atrfs(Operations):
         return {"st_gid": os.getgid(),
                 "st_uid": os.getuid(),
                 #"st_size": sectors * self.sector_size,
-                "st_size": self.get_actual_size(dir_entry.start),
+                "st_size": self.get_actual_size(dir_entry.first),
                 "st_ino": dir_entry.sector * 8 + dir_entry.position,
                 "st_nlink": 1,
-                "st_mode": (0 if dir_entry.flag & 0x20 else stat.S_IWUSR)
+                "st_mode": (0 if dir_entry.is_locked() else stat.S_IWUSR)
                         | stat.S_IFREG | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH,
                }
 
@@ -223,23 +255,18 @@ class atrfs(Operations):
         print "readdir called:", path
         full_path = self._full_path(path)
 
-        print "Waiting for VTOC lock"
-        self.vtoc_lock.acquire()
-        print "VTOC lock acquired"
-
+        self.vtoc_lock_acquire("readdir")
         direntry_iterator = iter(self.get_dir_entries())
-
-        self.vtoc_lock.release()
-        print "VTOC lock released"
+        self.vtoc_lock_release("readdir")
 
         return direntry_iterator
+
 
     def statfs(self, path):
         print "statfs called"
         full_path = self._full_path(path)
-        print "Waiting for VTOC lock"
-        self.vtoc_lock.acquire()
-        print "VTOC lock acquired"
+
+        self.vtoc_lock_acquire("statfs")
 
         data = self.read_sector(360)
         free_sectors = struct.unpack("<H", data[3:5])[0]
@@ -251,8 +278,7 @@ class atrfs(Operations):
         used_entries = self.count_valid_dir_entries();
         print "Total used: ", used_entries
 
-        self.vtoc_lock.release()
-        print "VTOC lock released"
+        self.vtoc_lock_release("statfs")
 
         return {"f_bavail": free_sectors,
                 "f_bfree": free_sectors,
@@ -266,6 +292,44 @@ class atrfs(Operations):
                 'f_namemax': 11
                }
 
+    def rename(self, path, new_name):
+        print "rename called", path, new_name
+        if path.startswith("/"):
+            path = path[1:]
+
+        if new_name.startswith("/"):
+            new_name = new_name[1:]
+
+        if not self.is_filename_valid(new_name):
+            # This is questionable, but how to report invalid names?
+            raise FuseOSError(errno.ENAMETOOLONG)
+
+        if self.find_dir_entry(self.to_dos_notation(new_name)):
+            raise FuseOSError(errno.EEXIST)
+
+        path = self.to_dos_notation(path)
+
+        self.vtoc_lock_acquire("rename")
+
+        dir_entry = self.find_dir_entry(path)
+
+        pprint (dir_entry)
+
+        if dir_entry:
+            data = self.read_sector(dir_entry.sector)
+            pprint(data)
+            offset = dir_entry.position * 16
+            data[offset + 5:offset + 16] = \
+                bytes(self.to_dos_notation(new_name))
+            pprint(data)
+            self.write_sector(dir_entry.sector, data)
+
+        self.vtoc_lock_release("rename")
+
+        if not dir_entry:
+            raise FuseOSError(errno.ENOENT)
+
+
     # File methods
     # ============
 
@@ -273,29 +337,31 @@ class atrfs(Operations):
         print "file open called:", path, flags
         full_path = self._full_path(path)
 
+        error = 0
+
         if path.startswith("/"):
             path = path[1:]
 
         path = self.to_dos_notation(path)
 
-        print "Waiting for VTOC lock"
-        self.vtoc_lock.acquire()
-        print "VTOC lock acquired"
-        dir_entry = self.find_dir_entry(path)
+        self.vtoc_lock_acquire("open")
 
-        #print flag, sectors, start
+        dir_entry = self.find_dir_entry(path)
 
         if dir_entry:
             if path not in self.handles:
                 print "Inserting: ", path
-                self.handles[path] = self.load_atari_file(dir_entry.start)
+                self.handles[path] = self.load_atari_file(dir_entry.first)
+        else:
+            error = errno.ENOENT
 
-        self.vtoc_lock.release()
-        print "VTOC lock released"
+        self.vtoc_lock_release("open")
+
+        if error:
+            raise FuseOSError(error)
 
         print "Returning handle: ", self.handles.keys().index(path)
         return self.handles.keys().index(path)
-        #return os.open(full_path, flags)
 
     def create(self, path, mode, fi=None):
         print "create called: ", path, mode
@@ -352,7 +418,7 @@ class atrfs(Operations):
                 free_sectors_index = 122
  
             if vtoc[sector_number] & bit_mask == 1:
-                print "Bitmap incosistency detected: file's sector marked free."
+                print "Bitmap inconsistency detected: file's sector marked free."
 
             vtoc[sector_number] |= bit_mask;
 
@@ -367,6 +433,8 @@ class atrfs(Operations):
 
         self.write_sector(360, vtocs[0])
         if vtocs[1]:
+            # copy bitmap of sectors 48-719 to VTOC2
+            vtocs[1][0:84] = vtocs[0][10 + 48 / 8 : 10 + 719 / 8 + 1]
             self.write_sector(1024, vtocs[1])
 
 
@@ -378,30 +446,36 @@ class atrfs(Operations):
 
     def unlink(self, path):
         print "unlink called"
+
+        error = 0
         if path.startswith("/"):
             path = path[1:]
 
         path = self.to_dos_notation(path)
 
-        print "Waiting for VTOC lock"
-        self.vtoc_lock.acquire()
-        print "VTOC lock acquired"
+        self.vtoc_lock_acquire("unlink")
 
         dir_entry = self.find_dir_entry(path)
 
-        #print flag, sectors, start
-
         if dir_entry:
-            print "Deleting: ", path
-            # Free cached file, but keep the inode number. If we just delete the key,
-            # OrderedDict would change the indices (which we use as inodes).
-            self.handles[path] = None
-            
-            self.free_bitmap(self.sector_chain(dir_entry.start))
-            self.mark_direntry_deleted(dir_entry)
+            if not dir_entry.is_locked():
+                print "Deleting: ", path
+                # Free cached file, but keep the inode number. If we just delete the key,
+                # OrderedDict would change the indices (which we use as inodes).
+                if path in self.handles:
+                    self.handles[path] = None
+                
+                self.free_bitmap(self.sector_chain(dir_entry.first))
+                self.mark_direntry_deleted(dir_entry)
+            else:
+                error = errno.EACCES
+        else:
+            error = errno.ENOENT
 
-        self.vtoc_lock.release()
-        print "VTOC lock released"
+        self.vtoc_lock_release("unlink")
+
+        if error:
+            raise FuseOSError(error)
 
 
     def flush(self, path, fh):
